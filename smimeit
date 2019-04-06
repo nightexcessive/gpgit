@@ -24,140 +24,117 @@ use strict;
 use warnings;
 use English;
 use File::Spec::Functions 'catfile';
+use File::Slurper 'read_text';
 use Crypt::SMIME;
 use MIME::Parser;
 
 ## Parse args
-  my $inline_flatten = 0;
-  my @recipients     = ();
-  {
-     help() unless @ARGV;
-     my @args = @ARGV;
-     while( @args ){
+my $inline_flatten = 0;
+my @recipients     = ();
+{
+    help() unless @ARGV;
+    my @args = @ARGV;
+    while (@args) {
         my $key = shift @args;
-	if( $key eq '--help' || $key eq '-h' ){
-	   help();
-	} elsif( $key =~ /^.+\@.+$/ ){
-	   push @recipients, $key;
-	} else {
-           die "Bad argument: $key\n";
-	}
-     }
-     die "Missing recipients\n" unless @recipients;
-  }
+        if ( $key eq '--help' || $key eq '-h' ) {
+            help();
+        }
+        elsif ( $key =~ /^.+\@.+$/ ) {
+            push @recipients, $key;
+        }
+        else {
+            die "Bad argument: $key\n";
+        }
+    }
+    die "Missing recipients\n" unless @recipients;
+}
 
 ## Set the home environment variable from the user running the script
-  $ENV{HOME} = (getpwuid($>))[7];
+$ENV{HOME} = ( getpwuid($>) )[7];
 
 ## Set the UID to match the EUID to prevent errors from GnuPG.
-  $REAL_USER_ID = $EFFECTIVE_USER_ID;
+$REAL_USER_ID = $EFFECTIVE_USER_ID;
 
-  {
-    my $certificate_directory = catfile($ENV{HOME}, ".smime-certificates");
+## Object for S/MIME encryption
+my $smime = new Crypt::SMIME->new();
+
+{
+    my $certificate_directory  = catfile( $ENV{HOME}, ".smime-certificates" );
     my @recipient_certificates = ();
-    while(@recipients) {
-      my $recipient = shift @recipients;
-
+    foreach (@recipients) {
+        push @recipient_certificates, read_text( catfile( $certificate_directory, $_ . ".pem" ) )
     }
-  }
-
-## Object for GPG encryption
-  my $smime = new Crypt::SMIME->new();
+    $smime->setPublicKey(@recipient_certificates);
+}
 
 ## Make sure we have the appropriate public key for all recipients
-  # foreach( @recipients ){
-  #    unless( $gpg->has_public_key( $_ ) ){
-  #       while(<STDIN>){
-  #          print;
-  #       }
-  #       exit 0;
-  #    }
-  # }
+# foreach( @recipients ){
+#    unless( $gpg->has_public_key( $_ ) ){
+#       while(<STDIN>){
+#          print;
+#       }
+#       exit 0;
+#    }
+# }
 
 ## Read the plain text email
-  my $plain;
-  {
-     local $/ = undef;
-     $plain = <STDIN>;
-  }
-
-## Test if it is already encrypted
-  if( $smime->isEncrypted( $plain ) ){
-     print $plain; exit 0;
-  }
+my $plain;
+{
+    local $/ = undef;
+    $plain = <STDIN>;
+}
 
 ## Parse the email
-  my $mime;
-  {
-     my $parser = new MIME::Parser();
-     $parser->decode_bodies(1);
-     $parser->output_to_core(1);
-     $mime = $parser->parse_data( $plain );
-  }
+my $mime;
+{
+    my $parser = new MIME::Parser();
+    $parser->decode_bodies(1);
+    $parser->output_to_core(1);
+    $mime = $parser->parse_data($plain);
+}
+
+## Test if it is already encrypted
+if ( $smime->isEncrypted($plain) ) {
+    $mime->head->add( 'X-Smimeit-Status', 'Already Encrypted' );
+    print $plain;
+    exit 0;
+}
 
 ## Encrypt
-  my $encrypted;
-  {
+my $encrypted;
+{
     my $code;
-    $mime->head->add('X-Smimeit-Executed', 'True' );
+    $mime->head->add( 'X-Smimeit-Status', 'Encrypted' );
     $encrypted = $smime->encrypt( $mime->stringify );
-  }
+}
 
-  ## Parse the encrypted email
-  my $encrypted_mime;
-  {
-     my $parser = new MIME::Parser();
-     $parser->decode_bodies(1);
-     $parser->output_to_core(1);
-     $mime = $parser->parse_data( $encrypted );
-  }
+## Parse the encrypted email
+my $encrypted_mime;
+{
+    my $parser = new MIME::Parser();
+    $parser->decode_bodies(1);
+    $parser->output_to_core(1);
+    $encrypted_mime = $parser->parse_data($encrypted);
+}
 
 ## Remove some headers which might have been broken by the process of encryption
-  $encrypted_mime->head()->delete($_) foreach qw( DKIM-Signature DomainKey-Signature );
+$encrypted_mime->head()->delete($_)
+  foreach qw( DKIM-Signature DomainKey-Signature );
 
 ## Print out the encrypted version
-  print $encrypted_mime->stringify;
+print $encrypted_mime->stringify;
 
 sub help {
-   print << "END_HELP";
+    print << "END_HELP";
 Usage: smimeit.pl recipient1 recipient2
 
 smimeit takes a list of email addresses as its arguments. The email is encrypted
-using the public keys associated with those email addresses.
+using the public keys associated with those email addresses, as found in
+\$HOME/.smime-certificates/example\@example.com.pem.
 
 Optional arguments:
 
   --help or -h
-
-Display this usage information.
-
-  --encrypt-mode prefer-inline / pgpmime / inline-or-plain
-
-Single part text emails can be encrypted inline, or using PGP/MIME. Multi-part
-emails can only be encrypted using PGP/MIME. "pgpmime" is the default for this
-argument and means we will always use PGP/MIME. "prefer-inline" means that we
-will use inline if possible, and PGP/MIME if not. "inline-or-plain" will use
-inline encryption for single part emails, and no encryption for multi-part
-emails.
-
-  --inline-flatten
-
-Only makes sense when using an "inline" encrypt-mode. When you enable this
-option, we attempt to convert multipart emails to a single part text/plain
-email, so inline encryption can be used. The methods we use are "lossy", but
-I believe them to be safe(ish):
-
-1.) When we find a multipart/alternative part which contains two parts: A
-    text/plain part with at least 10 characters in it, and a text/html part,
-    we remove the text/html part. The text/plain part *should* contain the
-    same content as the text/html part, but without the HTML markup.
-
-2.) When we find a multipart/related part which contains image parts which
-    are referred to from a HTML part via CID URLs, we remove those images.
-    We can do this, because we will be removing the HTML parts that are
-    referring to them, and so they *should* be redundant. We don't just
-    remove image parts, we only remove "related" image parts that are
-    referred by using CID URLs pointing at their Content-Id headers.
 END_HELP
-  exit 0;
+    exit 0;
 }
